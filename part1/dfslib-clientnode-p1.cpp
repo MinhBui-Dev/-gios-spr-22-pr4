@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <sys/inotify.h>
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/util/time_util.h>
 
 #include "dfslib-shared-p1.h"
 #include "proto-src/dfs-service.grpc.pb.h"
@@ -32,6 +33,7 @@ using dfs_service::file;
 using dfs_service::fileDetail;
 using dfs_service::fileList;
 using dfs_service::fileAttr;
+using dfs_service::Empty;
 
 using std::chrono::system_clock;
 using std::chrono::milliseconds;
@@ -121,7 +123,7 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
         return StatusCode::CANCELLED;
     }
     
-    return StatusCode::OK;
+    return status.error_code();
 
 }
 
@@ -197,7 +199,7 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
         return StatusCode::CANCELLED;
     }
     
-    return StatusCode::OK;
+    return status.error_code();
 
 
 
@@ -221,6 +223,34 @@ StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    // Create client context and set deadline
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create file request and set file name
+    file file;
+    file.set_filename(filename);
+
+    // Create server response
+    fileDetail serverResp;
+
+    // Call rpc deleteFile
+    Status status = service_stub->deleteFile(&context, file, &serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            return StatusCode::NOT_FOUND;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    return status.error_code();
 
 }
 
@@ -249,6 +279,37 @@ StatusCode DFSClientNodeP1::Stat(const std::string &filename, void* file_status)
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    // Create client context and set deadline
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create file request and set file name
+    file file;
+    file.set_filename(filename);
+
+    // Create server response
+    fileAttr serverResp;
+
+    // Call rpc getStatus
+    Status status = service_stub->getStatus(&context, file, &serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            return StatusCode::NOT_FOUND;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    // return serverResp to arg file_status
+    file_status = &serverResp;
+
+    return status.error_code();
 }
 
 StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool display) {
@@ -272,6 +333,39 @@ StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool displ
     // StatusCode::CANCELLED otherwise
     //
     //
+    
+    // Create client context and set deadline
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create server response & client request
+    fileList serverResp;
+    Empty request;  
+
+    // Call rpc getStatus
+    Status status = service_stub->listFile(&context,request,&serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            return StatusCode::NOT_FOUND;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    // Mapping file name and mtime to file_map
+    for (const fileDetail file : serverResp.file())
+    {   
+        // Convert google timestamp to int type
+        int timeSec = google::protobuf::util::TimeUtil::TimestampToSeconds(file.timemodified());
+        file_map->insert(std::pair<std::string,int>(file.filename(),timeSec));
+    }
+    
+    return status.error_code();
 }
 //
 // STUDENT INSTRUCTION:

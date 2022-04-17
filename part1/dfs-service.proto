@@ -4,6 +4,7 @@ package dfs_service;
 
 import "google/protobuf/timestamp.proto";
 
+
 service DFSService {
 
     // Add your service calls here
@@ -15,7 +16,7 @@ service DFSService {
     // 3. REQUIRED (Parts 1 & 2): A method to delete files from the server
     rpc deleteFile (file) returns (fileDetail);
     // 4. REQUIRED (Parts 1 & 2): A method to list all files on the server
-    rpc listFile (void) returns (fileList);
+    rpc listFile (Empty) returns (fileList);
     // 5. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
     rpc getStatus (file) returns (fileAttr);
     // 7. Any other methods you deem necessary to complete the tasks of this assignment
@@ -35,8 +36,8 @@ message file{
     string fileName = 1;
 }
 
-message void{
-
+message Empty{
+    string message = 1;
 }
 
 message fileDetail{
