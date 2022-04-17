@@ -27,6 +27,14 @@ using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
 
+using dfs_service::fileData;
+using dfs_service::file;
+using dfs_service::fileDetail;
+using dfs_service::fileList;
+using dfs_service::fileAttr;
+
+using std::chrono::system_clock;
+using std::chrono::milliseconds;
 //
 // STUDENT INSTRUCTION:
 //
@@ -64,6 +72,57 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    std::string filePath = WrapPath(filename);
+    struct stat fileSt;
+
+    // Check if file exists on client
+    if (stat(filePath.c_str(),&fileSt) != 0)
+    {
+        dfs_log(LL_ERROR) << "File Stat: " << filePath << " error";
+        return StatusCode::NOT_FOUND;
+    }
+    
+    // Get size and open file
+    int fileSize = fileSt.st_size;
+    std::ifstream myfile(filePath);
+
+    // Create client writer and server response
+    fileDetail serverResp;
+    std::unique_ptr<::grpc::ClientWriter<::dfs_service::fileData>> writer (service_stub->storeFile(&context, &serverResp));
+    
+    // Create fileData message and send filename
+    fileData data;
+    data.set_filename(filename);
+    writer->Write(data);
+
+    int byteSent = 0;
+    int byteToRead = 0;
+    // loop to read/send file content
+    while (byteSent < fileSize)
+    {
+        char buffer[CHUNK_SIZE];
+        byteToRead = MIN(fileSize - byteSent,CHUNK_SIZE);
+        myfile.read(buffer,byteToRead);
+        data.set_data(buffer,byteToRead);
+        writer -> Write(data);
+        byteSent += byteToRead;
+    }
+
+    // Close writer and file
+    myfile.close();
+    writer->WritesDone();
+    Status status = writer -> Finish();
+    
+    if (!status.ok())
+    {
+        return StatusCode::CANCELLED;
+    }
+    
+    return StatusCode::OK;
+
 }
 
 
@@ -88,6 +147,62 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+
+    // Set deadline_timeout for client
+    ClientContext context;
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    // Create file name request
+    file file;
+    file.set_filename(filename);
+
+    // Create fileData and client reader
+    fileData data;
+    std::unique_ptr<::grpc::ClientReader<::dfs_service::fileData>> reader(service_stub->fetchFile(&context, file));
+
+    // Create file system for write on client
+    std::string filePath = WrapPath(filename);
+    std::ofstream myfile;
+
+    // Reader read from server
+    while (reader -> Read(&data))
+    {
+        // Open file on first read
+        if(!myfile.is_open())
+        myfile.open(filePath,std::ios::trunc);
+
+        const std::string &str = data.data();
+        myfile << str;
+    }
+
+    // Close file if open
+    if (myfile.is_open())
+    {
+         myfile.close();
+    }
+    
+   
+    // Check status received from server
+    Status status =  reader -> Finish();
+
+  
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            return StatusCode::NOT_FOUND;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    return StatusCode::OK;
+
+
+
+
+
 }
 
 StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
