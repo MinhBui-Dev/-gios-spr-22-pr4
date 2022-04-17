@@ -9,15 +9,15 @@ service DFSService {
     // Add your service calls here
 
     // 1. REQUIRED (Parts 1 & 2): A method to store files on the server
-    rpc storeFile (stream dataChunk) return (serverAck);
+    rpc storeFile (stream fileData) returns (fileDetail);
     // 2. REQUIRED (Parts 1 & 2): A method to fetch files from the server
-    rpc fetchFile (file) return (stream dataChunk);
+    rpc fetchFile (file) returns (stream fileData);
     // 3. REQUIRED (Parts 1 & 2): A method to delete files from the server
-    rpc deleteFile (file) return (serverResp);
+    rpc deleteFile (file) returns (fileDetail);
     // 4. REQUIRED (Parts 1 & 2): A method to list all files on the server
-    rpc listFile (void) return (files);
+    rpc listFile (void) returns (fileList);
     // 5. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
-    rpc getStatus (file) return (fileStatus);
+    rpc getStatus (file) returns (fileAttr);
     // 7. Any other methods you deem necessary to complete the tasks of this assignment
 
 
@@ -26,8 +26,9 @@ service DFSService {
 
 // Add your message types here
 
-message dataChunk{
-    bytes data = 1;
+message fileData{
+    string fileName = 1;
+    bytes data = 2;
 }
 
 message file{
@@ -38,18 +39,18 @@ message void{
 
 }
 
-message serverAck{
+message fileDetail{
     string fileName =1;
-    google.protobuf.Timestamp modified = 2;
+    google.protobuf.Timestamp timeModified = 2;
 }
 
-message files{
-    repeated serverAck file = 1;
+message fileList{
+    repeated fileDetail file = 1;
 }
 
-message fileStatus{
+message fileAttr{
     string fileName = 1;
     uint64 fileSize = 2;
-    google.protobuf.Timestamp modified = 3;
-    google.protobuf.Timestamp created = 4;
+    google.protobuf.Timestamp timeModified = 3;
+    google.protobuf.Timestamp timeCreated = 4;
 }
