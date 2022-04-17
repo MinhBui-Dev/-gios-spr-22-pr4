@@ -13,6 +13,7 @@
 #include "proto-src/dfs-service.grpc.pb.h"
 
 #define DFS_RESET_TIMEOUT 3000
+#define CHUNK_SIZE 10000
 
 //
 // STUDENT INSTRUCTION:
