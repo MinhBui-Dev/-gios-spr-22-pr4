@@ -15,7 +15,6 @@
 #include <limits.h>
 #include <sys/inotify.h>
 #include <grpcpp/grpcpp.h>
-#include <google/protobuf/util/time_util.h>
 
 #include "dfslib-shared-p1.h"
 #include "proto-src/dfs-service.grpc.pb.h"
@@ -83,13 +82,13 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
     // Check if file exists on client
     if (stat(filePath.c_str(),&fileSt) != 0)
     {
-        dfs_log(LL_ERROR) << "File Stat: " << filePath << " error";
+        dfs_log(LL_SYSINFO) << "File: " << filename << " cannot be found/open.";
         return StatusCode::NOT_FOUND;
     }
     
     // Get size and open file
     int fileSize = fileSt.st_size;
-    std::ifstream myfile(filePath);
+    std::ifstream myFile(filePath);
 
     // Create client writer and server response
     fileDetail serverResp;
@@ -105,24 +104,32 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
     // loop to read/send file content
     while (byteSent < fileSize)
     {
-        char buffer[CHUNK_SIZE];
+        
         byteToRead = MIN(fileSize - byteSent,CHUNK_SIZE);
-        myfile.read(buffer,byteToRead);
+        char buffer[CHUNK_SIZE];
+        myFile.read(buffer,byteToRead);
         data.set_data(buffer,byteToRead);
         writer -> Write(data);
         byteSent += byteToRead;
     }
 
     // Close writer and file
-    myfile.close();
+    myFile.close();
     writer->WritesDone();
     Status status = writer -> Finish();
     
     if (!status.ok())
     {
+        if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        
         return StatusCode::CANCELLED;
     }
     
+    dfs_log(LL_SYSINFO) << "File: " << filename << " stored to server!";
     return status.error_code();
 
 }
@@ -158,52 +165,69 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
     file file;
     file.set_filename(filename);
 
+    dfs_log(LL_DEBUG) << "File Stat: " << file.filename() << " to fetch";
+
     // Create fileData and client reader
     fileData data;
     std::unique_ptr<::grpc::ClientReader<::dfs_service::fileData>> reader(service_stub->fetchFile(&context, file));
 
     // Create file system for write on client
     std::string filePath = WrapPath(filename);
-    std::ofstream myfile;
+    std::ofstream myFile;
 
     // Reader read from server
     while (reader -> Read(&data))
     {
         // Open file on first read
-        if(!myfile.is_open())
-        myfile.open(filePath,std::ios::trunc);
+        if(!myFile.is_open())
+        {
+            myFile.open(filePath,std::iostream::out | std::iostream::trunc);
+        }
+        
 
         const std::string &str = data.data();
-        myfile << str;
+
+        dfs_log(LL_DEBUG) << "Byte read to str: " << str.length();
+        
+        myFile << str;
     }
 
-    // Close file if open
-    if (myfile.is_open())
-    {
-         myfile.close();
-    }
-    
-   
     // Check status received from server
     Status status =  reader -> Finish();
+    dfs_log(LL_DEBUG) << "Check error code: " << status.error_code();
 
+   
+    //struct stat fileSt;
+    //stat(filePath.c_str(),&fileSt);
+    //dfs_log(LL_DEBUG) << "file size: " << fileSt.st_size;
+    
+    
   
     if (!status.ok())
     {   
         // Check if file not found
         if (status.error_code() == StatusCode::NOT_FOUND)
         {
+            dfs_log(LL_SYSINFO) << "File Stat: " << filePath << " cannot found";
             return StatusCode::NOT_FOUND;
         }
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_SYSINFO) << "Request at: " << filePath << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
+        {
+            dfs_log(LL_SYSINFO) << "Internal Error";
+            return StatusCode::CANCELLED;
+        }
         
-        return StatusCode::CANCELLED;
     }
     
+    myFile.close();
+
+    dfs_log(LL_DEBUG) << "Finished fetching file: " << file.filename();
     return status.error_code();
-
-
-
-
 
 }
 
@@ -244,9 +268,15 @@ StatusCode DFSClientNodeP1::Delete(const std::string& filename) {
         // Check if file not found
         if (status.error_code() == StatusCode::NOT_FOUND)
         {
+            dfs_log(LL_ERROR) << "File: " << filename << " cannot found";
             return StatusCode::NOT_FOUND;
         }
-        
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
         return StatusCode::CANCELLED;
     }
     
@@ -300,9 +330,15 @@ StatusCode DFSClientNodeP1::Stat(const std::string &filename, void* file_status)
         // Check if file not found
         if (status.error_code() == StatusCode::NOT_FOUND)
         {
+            dfs_log(LL_ERROR) << "File: " << filename << " cannot found";
             return StatusCode::NOT_FOUND;
         }
-        
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
         return StatusCode::CANCELLED;
     }
     
@@ -349,9 +385,9 @@ StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool displ
     if (!status.ok())
     {   
         // Check if file not found
-        if (status.error_code() == StatusCode::NOT_FOUND)
+        if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
         {
-            return StatusCode::NOT_FOUND;
+            return StatusCode::DEADLINE_EXCEEDED;
         }
         
         return StatusCode::CANCELLED;
@@ -360,9 +396,7 @@ StatusCode DFSClientNodeP1::List(std::map<std::string,int>* file_map, bool displ
     // Mapping file name and mtime to file_map
     for (const fileDetail file : serverResp.file())
     {   
-        // Convert google timestamp to int type
-        int timeSec = google::protobuf::util::TimeUtil::TimestampToSeconds(file.timemodified());
-        file_map->insert(std::pair<std::string,int>(file.filename(),timeSec));
+        file_map->insert(std::pair<std::string,int>(file.filename(),file.timemodified()));
     }
     
     return status.error_code();

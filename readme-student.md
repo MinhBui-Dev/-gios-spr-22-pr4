@@ -26,3 +26,5 @@ __Please tell us what you know doesn't work in this submission__
 __Please include references to any external materials that you used in your project__
 
 creating file before and after first read. 
+
+https://stackoverflow.com/questions/40163270/what-is-s-isreg-and-what-does-it-do

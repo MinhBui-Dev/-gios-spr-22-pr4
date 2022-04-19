@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package dfs_service;
 
-import "google/protobuf/timestamp.proto";
-
 
 service DFSService {
 
@@ -42,7 +40,7 @@ message Empty{
 
 message fileDetail{
     string fileName =1;
-    google.protobuf.Timestamp timeModified = 2;
+    uint64 timeModified = 2;
 }
 
 message fileList{
@@ -52,6 +50,6 @@ message fileList{
 message fileAttr{
     string fileName = 1;
     uint64 fileSize = 2;
-    google.protobuf.Timestamp timeModified = 3;
-    google.protobuf.Timestamp timeCreated = 4;
+    uint64 timeModified = 3;
+    uint64 timeCreated = 4;
 }

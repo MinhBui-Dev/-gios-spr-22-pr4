@@ -16,6 +16,7 @@
 #include "proto-src/dfs-service.grpc.pb.h"
 #include "dfslib-shared-p1.h"
 
+
 using grpc::Status;
 using grpc::Server;
 using grpc::StatusCode;
@@ -25,7 +26,12 @@ using grpc::ServerContext;
 using grpc::ServerBuilder;
 
 using dfs_service::DFSService;
-
+using dfs_service::fileData;
+using dfs_service::file;
+using dfs_service::fileDetail;
+using dfs_service::fileList;
+using dfs_service::fileAttr;
+using dfs_service::Empty;
 
 //
 // STUDENT INSTRUCTION:
@@ -89,6 +95,223 @@ public:
     // implementations of your protocol service methods
     //
 
+    Status storeFile(
+        ServerContext* context, 
+        ServerReader< fileData>* reader, 
+        fileDetail* response) override {
+        
+        fileData data;
+        
+        reader-> Read(&data);
+        const std::string fileName = data.filename();
+        const std::string filePath = WrapPath(fileName);
+
+        // Create output stream handler file
+        std::ofstream myFile;
+
+        while (reader -> Read(&data))
+        {
+            // Only open file if reader receives data
+            if(!myFile.is_open())
+            myFile.open(filePath,std::ios::trunc);
+            
+            // Rechecking timeout from client each time reading message
+            if (context->IsCancelled())
+            {
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+            }
+
+            const std::string str = data.data();
+            myFile << str;
+        }
+
+        struct stat fileSt;
+        if (stat(filePath.c_str(),&fileSt) != 0)
+        {
+            dfs_log(LL_ERROR) << "File: " << filePath << " cannot be found/open.";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+
+        long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+
+        response->set_filename(fileName);
+        response->set_timemodified(timeMod);
+         
+        return Status::OK;
+        
+    }
+
+    Status fetchFile(
+        ServerContext* context, 
+        const file* request, 
+        ServerWriter<fileData>* writer) override{
+
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+
+        struct stat fileSt;
+        if (stat(filePath.c_str(),&fileSt) != 0)
+        {
+            dfs_log(LL_ERROR) << "File Stat: " << filePath << " cannot be open/found!";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+
+        int fileSize = fileSt.st_size;
+        std::ifstream myFile;
+
+        myFile.open(filePath, std::ios::binary);
+
+        fileData data;
+
+        int byteSent = 0;
+        int byteToRead = 0;
+        // dfs_log(LL_DEBUG) << "file size: " << fileSize;
+        // loop to read/send file content
+        while (byteSent < fileSize)
+        {
+            // Create buffer memory to store file content
+            
+            byteToRead = MIN(fileSize - byteSent,CHUNK_SIZE);
+            char buffer[CHUNK_SIZE];
+            // Rechecking timeout from client each time reading message
+            if (context->IsCancelled())
+            {
+                myFile.close();
+                dfs_log(LL_ERROR) << "Request at: " << filePath << " exceed deadline";
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+            }
+
+            // read file content into buffer
+            myFile.read(buffer,byteToRead);
+
+            // copy content from buffer to data
+            data.set_data(std::string(buffer,byteToRead));
+            writer -> Write(data);
+
+            // dfs_log(LL_DEBUG) << "Byte read to send: " << byteToRead;
+
+            byteSent += byteToRead;
+        }
+        // dfs_log(LL_DEBUG) << "Byte sent total: " << byteSent;
+        // Finish sending, close file and return status
+        myFile.close();
+
+        dfs_log(LL_DEBUG) << "Finished fetching file: " << request->filename();
+        return Status::OK;
+    }
+
+    Status deleteFile(
+        ServerContext* context,
+        const file* request,
+        fileDetail* response) override {
+
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+
+        struct stat fileSt;
+
+        if (stat(filePath.c_str(), &fileSt) != 0)
+        {
+            dfs_log(LL_ERROR) << "File Stat: " << filePath << " error";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+        
+        if (context->IsCancelled())
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filePath << " exceed deadline";
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+        }
+
+        if (remove(filePath.c_str()) != 0)
+        {
+            dfs_log(LL_ERROR) << "File: " << filePath << " failed to remove";
+            return Status(StatusCode::INTERNAL, "Error on removing file");
+        }
+        
+        long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+        response->set_filename(fileName);
+        response->set_timemodified(timeMod);
+        
+        return Status::OK;
+        
+    }
+
+    Status listFile(
+        ServerContext* context,
+        const Empty* request,
+        fileList* response) override {
+
+        
+        // create directory handler
+        DIR *dir;
+        struct dirent *ent;
+        
+
+        if ((dir = opendir(mount_path.c_str())) == NULL)
+        {
+            dfs_log(LL_ERROR) << "Failed to open directory: " << mount_path;
+            return Status(StatusCode::INTERNAL, "Error on opening directory");
+        }
+
+        while ((ent = readdir(dir))!= NULL)
+        {
+            if (context->IsCancelled())
+            {
+                dfs_log(LL_SYSINFO) << "Request exceeded deadline";
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+            }
+
+            struct stat fileSt;
+            const std::string fileName = ent ->d_name;
+            const std::string filePath = WrapPath(fileName);
+            stat(filePath.c_str(), &fileSt);
+            if (!S_ISREG(fileSt.st_mode))
+            {
+                dfs_log(LL_SYSINFO) << "Not regular file " << fileName;
+                continue;
+            }
+            fileDetail* file = response->add_file();
+            long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+            file->set_filename(fileName);
+            file->set_timemodified(timeMod);            
+        }
+        
+        closedir(dir);
+        return Status::OK;
+    }
+
+    Status getStatus(
+        ServerContext* context,
+        const file* request,
+        fileAttr* response) override {
+        
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+
+        if (context->IsCancelled())
+        {
+            dfs_log(LL_SYSINFO) << "Request exceeded deadline";
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+        }
+        
+        struct stat fileSt;
+
+        if (stat(filePath.c_str(), &fileSt) != 0)
+        {
+            dfs_log(LL_SYSINFO) << "File: " << filePath << " cannot be found!";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+
+        long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+        long int timeCreate = static_cast<long int>(fileSt.st_ctim.tv_sec);
+
+        response->set_filename(fileName);
+        response->set_timecreated(timeCreate);
+        response->set_timemodified(timeMod);
+
+        return Status::OK;
+
+    }
 
 };
 
