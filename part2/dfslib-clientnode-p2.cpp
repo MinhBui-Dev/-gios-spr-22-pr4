@@ -31,6 +31,14 @@ using grpc::ClientWriter;
 using grpc::ClientReader;
 using grpc::ClientContext;
 
+using dfs_service::file;
+using dfs_service::fileData;
+using dfs_service::Empty;
+using dfs_service::fileDetail;
+using dfs_service::lockRequest;
+using dfs_service::fileAttr;
+using dfs_service::fileListAttr;
+
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -41,8 +49,8 @@ extern dfs_log_level_e DFS_LOG_LEVEL;
 // message types you are using to indicate
 // a file request and a listing of files from the server.
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+using FileRequestType = file;
+using FileListResponseType = fileListAttr;
 
 DFSClientNodeP2::DFSClientNodeP2() : DFSClientNode() {}
 DFSClientNodeP2::~DFSClientNodeP2() {}
@@ -211,9 +219,12 @@ void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
     // the async thread when a file event has been signaled?
     //
 
+    dirMutex.lock();
 
     callback();
+    dfs_log(LL_SYSINFO) << "Finished Inotify Watcher Callback and Unlock Mutex";
 
+    dirMutex.unlock();
 }
 
 //
