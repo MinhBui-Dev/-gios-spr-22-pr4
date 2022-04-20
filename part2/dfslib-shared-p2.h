@@ -55,7 +55,7 @@ struct EventStruct {
 //
 // Add any additional shared code here
 //
-
+#define CHUNK_SIZE 10000
 
 #endif
 

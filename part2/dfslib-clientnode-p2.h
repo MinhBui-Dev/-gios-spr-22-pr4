@@ -142,6 +142,8 @@ public:
     // You may add any additional declarations of methods or variables that you need here.
     //
 
-
+private:
+    // Mutex to synchonize InotifyWatcher and asynchronous callback request to server 
+    std::mutex dirMutex;
 };
 #endif
