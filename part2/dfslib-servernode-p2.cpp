@@ -29,7 +29,13 @@ using grpc::ServerBuilder;
 
 using dfs_service::DFSService;
 
-
+using dfs_service::file;
+using dfs_service::fileData;
+using dfs_service::Empty;
+using dfs_service::fileDetail;
+using dfs_service::lockRequest;
+using dfs_service::fileAttr;
+using dfs_service::fileListAttr;
 //
 // STUDENT INSTRUCTION:
 //
@@ -37,8 +43,9 @@ using dfs_service::DFSService;
 // message types you are using in your `dfs-service.proto` file
 // to indicate a file request and a listing of files from the server
 //
-using FileRequestType = FileRequest;
-using FileListResponseType = FileList;
+
+using FileRequestType = Empty;
+using FileListResponseType = fileListAttr;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -84,6 +91,20 @@ private:
     /** The vector of queued tags used to manage asynchronous requests **/
     std::vector<QueueRequest<FileRequestType, FileListResponseType>> queued_tags;
 
+    // Map object to store <filename and clientId
+    std::map<std::string, std::string> fileMap;
+
+    // Mutex controlling access to fileNameToClientId map
+    std::shared_timed_mutex fileMutex;
+    
+    // Mutex to control directory access
+    std::shared_timed_mutex dirMutex;
+
+    // helper function to delete fileName and ClientId from fileMap
+    void releaseFileLock(const std::string fileName){
+         std::lock_guard<std::shared_timed_mutex> lock(fileMutex);
+         fileMap.erase(fileName);
+    }
 
     /**
      * Prepend the mount path to the filename.
@@ -167,6 +188,7 @@ public:
         // The client should receive a list of files or modifications that represent the changes this service
         // is aware of. The client will then need to make the appropriate calls based on those changes.
         //
+        this->CallbackList(context,request,response);
 
     }
 
@@ -216,7 +238,286 @@ public:
     // Add your additional code here, including
     // the implementations of your rpc protocol methods.
     //
+    Status requestLock(
+        ServerContext* context,
+        const lockRequest* request,
+        Empty* response) override {
 
+        std::string clientID = request->clientid();
+        fileDetail file = request->filedetail();
+        std::string fileName = file.filename();
+
+        std::lock_guard<std::shared_timed_mutex> lock(fileMutex);
+        auto index = fileMap.find(fileName);
+        std::string fileClientId;
+
+        // if fileName in filemap and clientID is different Client Value
+        if ((index != fileMap.end()) && ((fileClientId = index->second).compare(clientID) != 0 ))
+        {
+            std::string msg = "File: "+fileName+" is locked by another client.";
+            dfs_log(LL_SYSINFO) << msg;
+            return Status(StatusCode::RESOURCE_EXHAUSTED, msg);
+        }
+        // if found fileName and clientId is the same
+        else if ((index != fileMap.end()) && ((fileClientId = index->second).compare(clientID) == 0 ))
+        {
+            std::string msg = "File: "+fileName+" is locked by same client.";
+            dfs_log(LL_SYSINFO) << msg;
+            return Status(StatusCode::OK, msg);
+        }
+        else
+        {
+            // Insert fileName and ClientID to fileMap
+            fileMap.insert(std::pair<std::string,std::string>(fileName,clientID));
+            std::string msg = "File: "+fileName+" is locked by client now.";
+            dfs_log(LL_SYSINFO) << msg;
+            return Status(StatusCode::OK, msg);
+        }
+    }
+    // @TODO validate file checksum
+    Status storeFile(
+        ServerContext* context,
+        ServerReader<fileData>* reader,
+        fileDetail* response) override{
+
+    }
+    
+    Status fetchFile(
+        ServerContext* context,
+        const file* request,
+        ServerWriter<fileData>* writer) override {
+        
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+     
+        struct stat fileSt;
+        if (stat(filePath.c_str(),&fileSt) != 0)
+        {
+            //dirMutex.unlock_shared();
+        
+            // Delete FileName and Client from FileMap
+            releaseFileLock(fileName);
+            dfs_log(LL_ERROR) << "File Stat: " << filePath << " cannot be open/found!";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+
+        int fileSize = fileSt.st_size;
+        std::ifstream myFile;
+        
+        // Grab shared directory mutex, eabling currently write of of dif files
+        // Block if callbacklist has exclusive mutex
+        // Queue for mutex if exclusive mutex call is waiting
+        dirMutex.lock_shared();
+
+        myFile.open(filePath, std::ios::binary);
+
+        fileData data;
+
+        int byteSent = 0;
+        int byteToRead = 0;
+        // dfs_log(LL_DEBUG) << "file size: " << fileSize;
+        // loop to read/send file content
+        while (byteSent < fileSize)
+        {
+            // Create buffer memory to store file content
+            
+            byteToRead = MIN(fileSize - byteSent,CHUNK_SIZE);
+            char buffer[CHUNK_SIZE];
+            // Rechecking timeout from client each time reading message
+            if (context->IsCancelled())
+            {
+                myFile.close();
+
+                dirMutex.unlock_shared();
+        
+                // Delete FileName and Client from FileMap
+                releaseFileLock(fileName);
+
+                dfs_log(LL_ERROR) << "Request at: " << filePath << " exceed deadline";
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+            }
+
+            // read file content into buffer
+            myFile.read(buffer,byteToRead);
+
+            // copy content from buffer to data
+            data.set_data(std::string(buffer,byteToRead));
+            writer -> Write(data);
+
+            // dfs_log(LL_DEBUG) << "Byte read to send: " << byteToRead;
+
+            byteSent += byteToRead;
+        }
+        // dfs_log(LL_DEBUG) << "Byte sent total: " << byteSent;
+        // Finish sending, close file and return status
+        myFile.close();
+        
+        dirMutex.unlock_shared();
+        
+        // Delete FileName and Client from FileMap
+        releaseFileLock(fileName);
+
+        dfs_log(LL_DEBUG) << "Finished fetching file: " << request->filename();
+        return Status::OK;
+
+    }
+
+    Status listFile(
+        ServerContext* context,
+        const Empty* request,
+        fileListAttr* response) override {
+
+        // create directory handler
+        DIR *dir;
+        struct dirent *ent;
+        
+        // Exclusive claim of mutex
+        // Block and queue if mutex is shared_lock
+        // any share_lock attempt will queue after exclusive lock()
+        dirMutex.lock();
+
+        if ((dir = opendir(mount_path.c_str())) == NULL)
+        {
+            dirMutex.unlock();
+            dfs_log(LL_ERROR) << "Failed to open directory: " << mount_path;
+            return Status(StatusCode::INTERNAL, "Error on opening directory");
+        }
+
+        while ((ent = readdir(dir))!= NULL)
+        {
+            if (context->IsCancelled())
+            {
+                dirMutex.unlock();
+                dfs_log(LL_SYSINFO) << "Request exceeded deadline";
+                return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+            }
+
+            struct stat fileSt;
+            const std::string fileName = ent ->d_name;
+            const std::string filePath = WrapPath(fileName);
+            stat(filePath.c_str(), &fileSt);
+            if (!S_ISREG(fileSt.st_mode))
+            {
+                dfs_log(LL_SYSINFO) << "Not regular file " << fileName;
+                continue;
+            }
+            fileAttr* file = response->add_file();
+            long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+            long int timeCreate = static_cast<long int>(fileSt.st_ctim.tv_sec);
+            int fileSize = fileSt.st_size;
+            file->set_filename(fileName);
+            file->set_filesize(fileSize);  
+            file->set_timemodified(timeMod);   
+            file->set_timecreated(timeCreate);
+                
+        }
+        
+        closedir(dir);
+        dirMutex.unlock();
+        return Status::OK;
+
+    }
+
+    Status getStatus(
+        ServerContext* context,
+        const file* request,
+        fileAttr* response) override {
+        
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+
+        if (context->IsCancelled())
+        {
+            dfs_log(LL_SYSINFO) << "Request exceeded deadline";
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+        }
+        
+        struct stat fileSt;
+
+        if (stat(filePath.c_str(), &fileSt) != 0)
+        {
+            dfs_log(LL_SYSINFO) << "File: " << filePath << " cannot be found!";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+
+        long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+        long int timeCreate = static_cast<long int>(fileSt.st_ctim.tv_sec);
+        int fileSize = fileSt.st_size;
+
+        response->set_filename(fileName);
+        response->set_filesize(fileSize);  
+        response->set_timemodified(timeMod);   
+        response->set_timecreated(timeCreate);
+
+        return Status::OK;
+    }
+
+    Status CallbackList(
+        ServerContext* context,
+        const Empty* request,
+        fileListAttr* response) override {
+        
+        Status status = this->listFile(context,request,response);
+        return status; 
+    }
+
+    Status deleteFile(
+        ServerContext* context,
+        const file* request,
+        fileDetail* response) override {
+        
+        const std::string fileName = request->filename();
+        const std::string filePath = WrapPath(fileName);
+
+        struct stat fileSt;
+
+        // Grab shared directory mutex, eabling currently write of of dif files
+        // Block if callbacklist has exclusive mutex
+        // Queue for mutex if exclusive mutex call is waiting
+        
+
+        if (stat(filePath.c_str(), &fileSt) != 0)
+        {
+            // Delete FileName and Client from FileMap
+            releaseFileLock(fileName);
+
+            dfs_log(LL_ERROR) << "File Stat: " << filePath << " error";
+            return Status(StatusCode::NOT_FOUND, "Struct Stat cannot open file.");
+        }
+        
+        if (context->IsCancelled())
+        {
+            // Delete FileName and Client from FileMap
+            releaseFileLock(fileName);
+
+            dfs_log(LL_ERROR) << "Request at: " << filePath << " exceed deadline";
+            return Status(StatusCode::DEADLINE_EXCEEDED, "Deadline exceeded or Client cancelled, abandoning.");
+        }
+        dirMutex.lock_shared();
+
+        if (remove(filePath.c_str()) != 0)
+        {
+            dirMutex.unlock_shared();
+
+            // Delete FileName and Client from FileMap
+            releaseFileLock(fileName);
+
+            dfs_log(LL_ERROR) << "File: " << filePath << " failed to remove";
+            return Status(StatusCode::INTERNAL, "Error on removing file");
+        }
+        
+        long int timeMod = static_cast<long int>(fileSt.st_mtim.tv_sec);
+        response->set_filename(fileName);
+        response->set_timemodified(timeMod);
+        
+        dirMutex.unlock_shared();
+            
+        // Delete FileName and Client from FileMap
+        releaseFileLock(fileName);
+        return Status::OK;
+    }
+
+    
 
 };
 
