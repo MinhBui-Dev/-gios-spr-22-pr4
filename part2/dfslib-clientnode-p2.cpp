@@ -39,6 +39,8 @@ using dfs_service::lockRequest;
 using dfs_service::fileAttr;
 using dfs_service::fileListAttr;
 
+using std::chrono::system_clock;
+using std::chrono::milliseconds;
 
 extern dfs_log_level_e DFS_LOG_LEVEL;
 
@@ -82,6 +84,73 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     // StatusCode::CANCELLED otherwise
     //
     //
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    std::string filePath = WrapPath(filename);
+    struct stat fileSt;
+
+    // Check if file exists on client
+    if (stat(filePath.c_str(),&fileSt) != 0)
+    {
+        dfs_log(LL_SYSINFO) << "File: " << filename << " cannot be found/open.";
+        return StatusCode::NOT_FOUND;
+    }
+    
+    StatusCode status = this->RequestWriteAccess(filename);
+
+    if (status != StatusCode::OK)
+    {
+        dfs_log(LL_SYSINFO) << "Failed to request write lock.";
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+
+    // Get size and open file
+    int fileSize = fileSt.st_size;
+    std::ifstream myFile(filePath);
+
+    // Create client writer and server response
+    fileDetail serverResp;
+    std::unique_ptr<::grpc::ClientWriter<::dfs_service::fileData>> writer (service_stub->storeFile(&context, &serverResp));
+    
+    // Create fileData message and send filename
+    fileData data;
+    data.set_filename(filename);
+    writer->Write(data);
+
+    int byteSent = 0;
+    int byteToRead = 0;
+    // loop to read/send file content
+    while (byteSent < fileSize)
+    {
+        
+        byteToRead = MIN(fileSize - byteSent,CHUNK_SIZE);
+        char buffer[CHUNK_SIZE];
+        myFile.read(buffer,byteToRead);
+        data.set_data(buffer,byteToRead);
+        writer -> Write(data);
+        byteSent += byteToRead;
+    }
+
+    // Close writer and file
+    myFile.close();
+    writer->WritesDone();
+    Status status = writer -> Finish();
+    
+    if (!status.ok())
+    {
+        if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    dfs_log(LL_SYSINFO) << "File: " << filename << " stored to server!";
+    return status.error_code();
 
 }
 
