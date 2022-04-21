@@ -36,7 +36,8 @@ message file{
 
 message fileData{
     string fileName = 1;
-    bytes data = 2;
+    uint32 crc = 2;
+    bytes data = 3;
 }
 
 message Empty{
