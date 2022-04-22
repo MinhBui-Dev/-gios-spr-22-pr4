@@ -38,6 +38,7 @@ using dfs_service::fileDetail;
 using dfs_service::lockRequest;
 using dfs_service::fileAttr;
 using dfs_service::fileListAttr;
+using dfs_service::callbackfile;
 
 using std::chrono::system_clock;
 using std::chrono::milliseconds;
@@ -51,7 +52,7 @@ extern dfs_log_level_e DFS_LOG_LEVEL;
 // message types you are using to indicate
 // a file request and a listing of files from the server.
 //
-using FileRequestType = file;
+using FileRequestType = callbackfile;
 using FileListResponseType = fileListAttr;
 
 DFSClientNodeP2::DFSClientNodeP2() : DFSClientNode() {}
@@ -97,9 +98,9 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
         return StatusCode::NOT_FOUND;
     }
     
-    StatusCode status = this->RequestWriteAccess(filename);
+    StatusCode lockStatus = this->RequestWriteAccess(filename);
 
-    if (status != StatusCode::OK)
+    if (lockStatus != StatusCode::OK)
     {
         dfs_log(LL_SYSINFO) << "Failed to request write lock.";
         return StatusCode::RESOURCE_EXHAUSTED;
@@ -112,11 +113,19 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
 
     // Create client writer and server response
     fileDetail serverResp;
+    fileData data;
     std::unique_ptr<::grpc::ClientWriter<::dfs_service::fileData>> writer (service_stub->storeFile(&context, &serverResp));
     
     // Create fileData message and send filename
-    fileData data;
-    data.set_filename(filename);
+    long int timeMod = static_cast<long int>(fileSt.st_mtime);
+    uint32_t client_crc = dfs_file_checksum(filePath, &this->crc_table);
+
+    // set fileName, crc, timeMod
+    data.mutable_file()->set_filename(filename);
+    data.mutable_file()->set_timemodified(timeMod);
+    data.mutable_file()->set_crc(client_crc);
+
+    dfs_log(LL_SYSINFO) << "Request at: " << data.file().filename() << " to store";
     writer->Write(data);
 
     int byteSent = 0;
@@ -136,15 +145,22 @@ grpc::StatusCode DFSClientNodeP2::Store(const std::string &filename) {
     // Close writer and file
     myFile.close();
     writer->WritesDone();
+
     Status status = writer -> Finish();
     
     if (!status.ok())
     {
         if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
         {
-            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            dfs_log(LL_SYSINFO) << "Request at: " << filename << " exceed deadline.";
             return StatusCode::DEADLINE_EXCEEDED;
         }
+        if (status.error_code() == StatusCode::ALREADY_EXISTS)
+        {
+            dfs_log(LL_SYSINFO) << "Store file: " << filename << " already exist.";
+            return status.error_code();
+        }
+        
         
         return StatusCode::CANCELLED;
     }
@@ -175,6 +191,37 @@ grpc::StatusCode DFSClientNodeP2::RequestWriteAccess(const std::string &filename
     //
     //
 
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    std::string clientId = ClientId();
+
+    lockRequest request;
+    request.set_clientid(client_id);
+    request.mutable_filedetail()->set_filename(filename);
+    Empty resp;
+
+    Status status = service_stub->requestLock(&context,request,&resp);
+
+    if (!status.ok())
+    {
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            dfs_log(LL_SYSINFO) << "File: " << filename << " cannot found";
+            return StatusCode::NOT_FOUND;
+        }
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_SYSINFO) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
+        return StatusCode::CANCELLED;
+    }
+    
+    return status.error_code();
+
+
 }
 
 grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
@@ -200,6 +247,114 @@ grpc::StatusCode DFSClientNodeP2::Fetch(const std::string &filename) {
     //
     // Hint: You may want to match the mtime on local files to the server's mtime
     //
+    
+
+    StatusCode lockStatus = this->RequestWriteAccess(filename);
+
+    if (lockStatus != StatusCode::OK)
+    {
+        dfs_log(LL_SYSINFO) << "Failed to request write lock.";
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+    context.set_deadline(system_clock::now() + milliseconds(deadline_timeout));
+
+    file requestFile;
+    requestFile.set_filename(filename);
+
+    // Create fileData and client reader
+    std::unique_ptr<::grpc::ClientReader<::dfs_service::fileData>> reader(service_stub->fetchFile(&context, requestFile));
+
+    fileData data;
+
+    reader -> Read(&data);
+    fileDetail serverFile = data.file();
+    long int serverTimeMod = serverFile.timemodified();
+    uint32_t server_crc = data.file().crc();
+
+    std::string filePath = WrapPath(filename);
+    struct stat fileSt;
+
+    // Check if file already exists on server
+    if(stat(filePath.c_str(),&fileSt) == 0)
+    {   
+        // Check if timeMod is the same 
+        long int clientTimeMod = static_cast<long int>(fileSt.st_mtime);
+        if (serverTimeMod == clientTimeMod)
+        {
+
+            std::string msg = "Files: "+filename+" from client and server are same version .";
+            dfs_log(LL_SYSINFO) << msg;
+            return StatusCode::ALREADY_EXISTS;
+        }
+        else
+        {   
+            // validate checksum to see if the content is the same
+            uint32_t client_crc = dfs_file_checksum(filePath, &this->crc_table);
+            if (server_crc == client_crc)
+            {
+                // if content is the same and client time is newer
+                if (clientTimeMod < serverTimeMod)
+                {
+                    // Update modTime on client file
+                    struct utimbuf ub;
+                    ub.modtime = serverTimeMod;
+                    ub.actime = fileSt.st_atime;
+                    utime(filePath.c_str(),&ub);
+                }
+
+                std::string msg = "Client File: "+filename+" is up to date on client.";
+                dfs_log(LL_SYSINFO) << msg;
+                return StatusCode::ALREADY_EXISTS;
+            }
+        }      
+    }
+    // store file to client
+    std::ofstream myFile;
+
+    while (reader -> Read(&data))
+    {
+        // Only open file if reader receives data
+        if(!myFile.is_open())
+        {
+            myFile.open(filePath,std::ios::trunc);
+        }
+
+        const std::string& str = data.data();
+        myFile << str;
+    }
+
+    // Check status received from server
+    Status status =  reader -> Finish();
+    myFile.close();
+    dfs_log(LL_DEBUG) << "Check error code: " << status.error_code();
+    
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            dfs_log(LL_SYSINFO) << "File: " << filePath << " cannot found";
+            return StatusCode::NOT_FOUND;
+        }
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_SYSINFO) << "Request at: " << filePath << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
+        {
+            dfs_log(LL_SYSINFO) << "Internal Error";
+            return StatusCode::CANCELLED;
+        }
+        
+    }
+    
+    
+
+    dfs_log(LL_DEBUG) << "Finished fetching file: " << filename;
+    return status.error_code();
 }
 
 grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
@@ -224,6 +379,50 @@ grpc::StatusCode DFSClientNodeP2::Delete(const std::string &filename) {
     //
     //
 
+    // Create client context and set deadline
+    
+
+    // Request file modification lock
+    StatusCode lockStatus = this->RequestWriteAccess(filename);
+    if (lockStatus != StatusCode::OK)
+    {
+        dfs_log(LL_SYSINFO) << "Failed to request write lock.";
+        return StatusCode::RESOURCE_EXHAUSTED;
+    }
+
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create file request and set file name
+    file file;
+    file.set_filename(filename);
+
+    // Create server response
+    fileDetail serverResp;
+
+    // Call rpc deleteFile
+    Status status = service_stub->deleteFile(&context, file, &serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            dfs_log(LL_ERROR) << "File: " << filename << " cannot found";
+            return StatusCode::NOT_FOUND;
+        }
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
+        return StatusCode::CANCELLED;
+    }
+    
+    return status.error_code();
+
 }
 
 grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool display) {
@@ -244,6 +443,36 @@ grpc::StatusCode DFSClientNodeP2::List(std::map<std::string,int>* file_map, bool
     // StatusCode::CANCELLED otherwise
     //
     //
+    // Create client context and set deadline
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create server response & client request
+    fileListAttr serverResp;
+    callbackfile request;  
+
+    // Call rpc getStatus
+    Status status = service_stub->listFile(&context,request,&serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        
+        return StatusCode::CANCELLED;
+    }
+    
+    // Mapping file name and mtime to file_map
+    for (const fileAttr file : serverResp.file())
+    {   
+        file_map->insert(std::pair<std::string,int>(file.filename(),file.timemodified()));
+    }
+    
+    return status.error_code();
 }
 
 grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_status) {
@@ -265,7 +494,43 @@ grpc::StatusCode DFSClientNodeP2::Stat(const std::string &filename, void* file_s
     // StatusCode::CANCELLED otherwise
     //
     //
-}
+    // Create client context and set deadline
+    ClientContext context;
+    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
+
+    // Create file request and set file name
+    file file;
+    file.set_filename(filename);
+
+    // Create server response
+    fileAttr serverResp;
+
+    // Call rpc getStatus
+    Status status = service_stub->getStatus(&context, file, &serverResp);
+
+    // Check return status
+    if (!status.ok())
+    {   
+        // Check if file not found
+        if (status.error_code() == StatusCode::NOT_FOUND)
+        {
+            dfs_log(LL_ERROR) << "File: " << filename << " cannot found";
+            return StatusCode::NOT_FOUND;
+        }
+        else if (status.error_code() == StatusCode::DEADLINE_EXCEEDED)
+        {
+            dfs_log(LL_ERROR) << "Request at: " << filename << " exceed deadline";
+            return StatusCode::DEADLINE_EXCEEDED;
+        }
+        else
+        return StatusCode::CANCELLED;
+    }
+    
+    // return serverResp to arg file_status
+    file_status = &serverResp;
+
+    return status.error_code();
+}   
 
 void DFSClientNodeP2::InotifyWatcherCallback(std::function<void()> callback) {
 
@@ -363,8 +628,49 @@ void DFSClientNodeP2::HandleCallbackList() {
                 // Send an update to the server?
                 // Do nothing?
                 //
+                dirMutex.lock();
+                for (const fileAttr& serverFile:call_data->reply.file())
+                {
+                    std::string fileName = serverFile.filename();
+                    std::string filePath = WrapPath(fileName);
+                    struct stat fileSt;
+                    if (stat(filePath.c_str(),&fileSt) != 0)
+                    {
+                        dfs_log(LL_SYSINFO) << "Remote file: " << fileName << " cannot found";
+                        dfs_log(LL_SYSINFO) << "Fetch file: " << fileName << " from server now";
+                        this->Fetch(fileName);
+                    }
+                    else
+                    {
+                       long int serverTimeMod = serverFile.timemodified();
+                       long int clientTimeMod = static_cast<long int>(fileSt.st_mtime);
+                       uint32_t server_crc = serverFile.crc();
+                       uint32_t client_crc = dfs_file_checksum(filePath, &this->crc_table);
+                       // client file is more recent
+                       if (serverTimeMod < clientTimeMod)
+                       {    
+                            dfs_log(LL_SYSINFO) << "Client file: " << fileName << " is newer. Store to server now.";
+                            this->Store(fileName);
+                       }
+                       else if (clientTimeMod < serverTimeMod && server_crc == client_crc)
+                       {
+                            dfs_log(LL_SYSINFO) << "Client file: " << fileName << " is updated with server's time";
+                            struct utimbuf ub;
+                            ub.modtime = serverTimeMod;
+                            ub.actime = fileSt.st_atime;
+                            utime(filePath.c_str(),&ub);
+                       }
+                       else if (clientTimeMod < serverTimeMod && server_crc != client_crc)
+                       {
+                           dfs_log(LL_SYSINFO) << "Remote file: " << fileName << " is more updated. Fetch now.";
+                           this->Fetch(fileName);
+                       }
+                        
+                    }
+                    
+                }
 
-
+                dirMutex.unlock();
 
             } else {
                 dfs_log(LL_ERROR) << "Status was not ok. Will try again in " << DFS_RESET_TIMEOUT << " milliseconds.";

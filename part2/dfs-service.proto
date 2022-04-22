@@ -11,7 +11,7 @@ service DFSService {
     // 2. REQUIRED (Parts 1 & 2): A method to fetch files from the server
     rpc fetchFile (file) returns (stream fileData);
     // 3. REQUIRED (Parts 1 & 2): A method to list all files on the server
-    rpc listFile (Empty) returns (fileListAttr);
+    rpc listFile (callbackfile) returns (fileListAttr);
     // 4. REQUIRED (Parts 1 & 2): A method to get the status of a file on the server
     rpc getStatus (file) returns (fileAttr);
     // 5. REQUIRED (Part 2 only): A method to request a write lock from the server
@@ -20,7 +20,7 @@ service DFSService {
     //                            from a client. This method should return a listing of files along with their
     //                            attribute information. The expected attribute information should include name,
     //                            size, modified time, and creation time.
-    rpc CallbackList (Empty) returns (fileListAttr);
+    rpc CallbackList (callbackfile) returns (fileListAttr);
     // 7. REQUIRED (Part 2 only): A method to delete a file from the server
     rpc deleteFile (file) returns (fileDetail);
     // 8. Any other methods you deem necessary to complete the tasks of this assignment
@@ -33,11 +33,12 @@ service DFSService {
 message file{
     string fileName = 1;
 }
-
+message callbackfile{
+    string name = 1;
+}
 message fileData{
-    string fileName = 1;
-    uint32 crc = 2;
-    bytes data = 3;
+    fileDetail file = 1;
+    bytes data = 2;
 }
 
 message Empty{
@@ -47,6 +48,7 @@ message Empty{
 message fileDetail{
     string fileName = 1;
     uint64 timeModified = 2;
+    uint32 crc = 3;
 }
 
 message lockRequest{
@@ -60,8 +62,10 @@ message fileAttr{
     uint64 fileSize = 2;
     uint64 timeModified = 3;
     uint64 timeCreated = 4;
+    uint32 crc = 5;
 }
 
 message fileListAttr{
     repeated fileAttr file = 1;
 }
+

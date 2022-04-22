@@ -74,7 +74,6 @@ StatusCode DFSClientNodeP1::Store(const std::string &filename) {
     //
     //
     ClientContext context;
-    context.set_deadline(system_clock::now()+milliseconds(deadline_timeout));
 
     std::string filePath = WrapPath(filename);
     struct stat fileSt;
@@ -185,7 +184,7 @@ StatusCode DFSClientNodeP1::Fetch(const std::string &filename) {
         }
         
 
-        const std::string &str = data.data();
+        const std::string str = data.data();
 
         dfs_log(LL_DEBUG) << "Byte read to str: " << str.length();
         

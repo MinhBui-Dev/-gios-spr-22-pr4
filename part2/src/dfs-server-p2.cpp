@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
     char option_char;
     int debug_level = static_cast<int>(LL_ERROR);
     long num_async_threads = 4;
-    std::string mount_path = "mnt/server/";
+    std::string mount_path = "mnt/server/sample-files/";
     std::string server_address = "0.0.0.0:42001";
 
     while((option_char = getopt_long(argc, argv, short_opts, long_opts, nullptr)) != -1) {
